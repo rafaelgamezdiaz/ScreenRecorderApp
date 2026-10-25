@@ -40,7 +40,7 @@ class _ScreenRecorderAppState extends State<ScreenRecorderApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Screen & Audio Recorder',
+      title: 'ScreenRec',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,

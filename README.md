@@ -64,30 +64,39 @@ android/app/src/main/kotlin/com/screenrecorder/app/screen_recorder_gamez/
 
 ---
 
-## Compilación para Producción (Modo Release)
+## Compilación e Instalación para Producción (Modo Release)
 
-Para generar el archivo APK optimizado en modo **Release** (sin dependencias ni sobrecarga del modo debug), ejecutar en la raíz del proyecto:
+El modo **Release** compila la aplicación en binario AOT (Ahead-Of-Time) optimizado, eliminando la sobrecarga del depurador, la bandera de depuración y maximizando el rendimiento general (equivalente a una app descargada desde Play Store).
+
+### 1. Compilar e Instalar Directamente en el Teléfono
+Si el dispositivo está conectado por USB (o Wi-Fi debugging), este comando compila en modo Release y lo instala de inmediato en el teléfono:
+
+```bash
+flutter run --release
+```
+
+### 2. Solo Generar el Archivo APK (Sin Instalar)
+Para generar únicamente el archivo empaquetado `.apk` instalable:
 
 ```bash
 flutter build apk --release
 ```
 
-El instalador final se generará en la siguiente ruta:
+El instalador final se generará en:
 
 ```
 build/app/outputs/flutter-apk/app-release.apk
 ```
 
-### Instalación Directa por ADB
+### 3. Instalar un APK Release Ya Compilado
+Si el APK ya fue generado previamente y se desea transferir al teléfono conectado:
 
-Si el dispositivo está conectado vía USB con depuración habilitada:
-
+Con Flutter:
 ```bash
 flutter install --release
 ```
 
-O utilizando ADB directamente:
-
+O directamente mediante ADB:
 ```bash
 adb install -r build/app/outputs/flutter-apk/app-release.apk
 ```
