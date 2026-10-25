@@ -4,6 +4,9 @@ import android.content.Context
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.*
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.SystemClock
@@ -14,6 +17,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.concurrent.thread
+import kotlin.math.sqrt
 
 @RequiresApi(Build.VERSION_CODES.Q)
 class ScreenRecorder(
@@ -53,6 +57,10 @@ class ScreenRecorder(
 
     private var micRecord: AudioRecord? = null
     private var internalRecord: AudioRecord? = null
+
+    private var noiseSuppressor: NoiseSuppressor? = null
+    private var agc: AutomaticGainControl? = null
+    private var aec: AcousticEchoCanceler? = null
 
     private val micQueue = ConcurrentLinkedQueue<ShortArray>()
     private val internalQueue = ConcurrentLinkedQueue<ShortArray>()
@@ -152,17 +160,84 @@ class ScreenRecorder(
                     AudioFormat.ENCODING_PCM_16BIT
                 )
                 val bufferSize = (micMinBuffer * 2).coerceAtLeast(4096)
-                val record = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-                )
-                if (record.state == AudioRecord.STATE_INITIALIZED) {
+
+                // Priorizar VOICE_RECOGNITION para habilitar procesamiento direccional y de voz del dispositivo
+                var record: AudioRecord? = null
+                try {
+                    val voiceRecord = AudioRecord(
+                        MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                        sampleRate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufferSize
+                    )
+                    if (voiceRecord.state == AudioRecord.STATE_INITIALIZED) {
+                        record = voiceRecord
+                        Log.i(tag, "AudioRecord inicializado con VOICE_RECOGNITION")
+                    } else {
+                        voiceRecord.release()
+                    }
+                } catch (e: Exception) {
+                    Log.w(tag, "VOICE_RECOGNITION no disponible, usando fallback: ${e.message}")
+                }
+
+                // Fallback a fuente MIC estándar si VOICE_RECOGNITION no estuviese disponible
+                if (record == null) {
+                    val standardRecord = AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        sampleRate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufferSize
+                    )
+                    if (standardRecord.state == AudioRecord.STATE_INITIALIZED) {
+                        record = standardRecord
+                        Log.i(tag, "AudioRecord inicializado con MIC estándar")
+                    } else {
+                        standardRecord.release()
+                    }
+                }
+
+                if (record != null && record.state == AudioRecord.STATE_INITIALIZED) {
                     micRecord = record
+                    val sessionId = record.audioSessionId
+
+                    // Habilitar cancelación y supresión de ruido por hardware
+                    if (NoiseSuppressor.isAvailable()) {
+                        try {
+                            noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply {
+                                enabled = true
+                            }
+                            Log.i(tag, "Hardware NoiseSuppressor habilitado")
+                        } catch (e: Exception) {
+                            Log.w(tag, "Error activando NoiseSuppressor: ${e.message}")
+                        }
+                    }
+
+                    // Habilitar control automático de ganancia por hardware
+                    if (AutomaticGainControl.isAvailable()) {
+                        try {
+                            agc = AutomaticGainControl.create(sessionId)?.apply {
+                                enabled = true
+                            }
+                            Log.i(tag, "Hardware AutomaticGainControl habilitado")
+                        } catch (e: Exception) {
+                            Log.w(tag, "Error activando AutomaticGainControl: ${e.message}")
+                        }
+                    }
+
+                    // Habilitar cancelador de eco acústico si está disponible
+                    if (AcousticEchoCanceler.isAvailable()) {
+                        try {
+                            aec = AcousticEchoCanceler.create(sessionId)?.apply {
+                                enabled = true
+                            }
+                            Log.i(tag, "Hardware AcousticEchoCanceler habilitado")
+                        } catch (e: Exception) {
+                            Log.w(tag, "Error activando AcousticEchoCanceler: ${e.message}")
+                        }
+                    }
                 } else {
-                    record.release()
                     Log.w(tag, "Mic AudioRecord no pudo ser inicializado")
                 }
             } catch (e: Exception) {
@@ -339,6 +414,7 @@ class ScreenRecorder(
 
         try {
             record.stop()
+            releaseAudioFx()
             record.release()
         } catch (_: Exception) {}
     }
@@ -383,26 +459,54 @@ class ScreenRecorder(
         var totalFramesWritten = 0L
         val frameDurationMs = (framesPerChunk * 1000L) / sampleRate // ~23 ms
 
+        // Procesamiento DSP de voz en tiempo real
+        var gateGain = 0.0f
+        val gateThresholdRms = 350.0 // Atenúa ruido de fondo ambiental y respiración
+        val voiceGainBoost = 1.6f    // Ganancia limpia para voz clara y potente
+
         while (isRecording) {
             val startTime = SystemClock.elapsedRealtime()
 
             val micBuffer = micQueue.poll()
             val intBuffer = internalQueue.poll()
 
-            // Si ambos son nulos y no hay datos, generar silencio para mantener sincronía
+            // Detección de energía RMS de voz para compuerta dinámica suave
+            if (micBuffer != null && micBuffer.isNotEmpty()) {
+                var sumSq = 0.0
+                for (s in micBuffer) {
+                    sumSq += s * s
+                }
+                val rms = sqrt(sumSq / micBuffer.size)
+
+                if (rms >= gateThresholdRms) {
+                    gateGain += (1.0f - gateGain) * 0.45f // Ataque ágil al comenzar a hablar
+                } else {
+                    gateGain += (0.05f - gateGain) * 0.08f // Expansor suave hacia silencio de fondo (-26 dB)
+                }
+            } else {
+                gateGain += (0.0f - gateGain) * 0.1f
+            }
+
+            // Auto-ducking: atenuación de audio interno mientras se habla para priorizar la locución
+            val duckingFactor = 1.0f - (gateGain * 0.35f)
+
             byteBuffer.clear()
             for (i in 0 until framesPerChunk) {
-                val micSample = if (micBuffer != null && i < micBuffer.size) micBuffer[i].toInt() else 0
+                val rawMic = if (micBuffer != null && i < micBuffer.size) micBuffer[i].toInt() else 0
+                val processedMic = (rawMic * gateGain * voiceGainBoost).toFloat()
 
-                val intLeft = if (intBuffer != null && (i * 2) < intBuffer.size) intBuffer[i * 2].toInt() else 0
-                val intRight = if (intBuffer != null && (i * 2 + 1) < intBuffer.size) intBuffer[i * 2 + 1].toInt() else 0
+                val rawLeft = if (intBuffer != null && (i * 2) < intBuffer.size) intBuffer[i * 2].toInt() else 0
+                val rawRight = if (intBuffer != null && (i * 2 + 1) < intBuffer.size) intBuffer[i * 2 + 1].toInt() else 0
 
-                // Mezclar micrófono centrado en ambos canales con audio interno
-                val outLeft = (intLeft + micSample).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                val outRight = (intRight + micSample).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                val intLeft = rawLeft * duckingFactor
+                val intRight = rawRight * duckingFactor
 
-                byteBuffer.putShort(outLeft)
-                byteBuffer.putShort(outRight)
+                // Limitador no lineal para evitar saturación y distorsión digital
+                val mixedLeft = softLimit(intLeft + processedMic)
+                val mixedRight = softLimit(intRight + processedMic)
+
+                byteBuffer.putShort(mixedLeft.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
+                byteBuffer.putShort(mixedRight.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
             }
             byteBuffer.flip()
 
@@ -497,11 +601,38 @@ class ScreenRecorder(
         }
     }
 
+    private fun softLimit(sample: Float): Float {
+        val threshold = 28000f
+        return if (sample > threshold) {
+            threshold + (sample - threshold) / (1f + (sample - threshold) / 5000f)
+        } else if (sample < -threshold) {
+            -threshold + (sample + threshold) / (1f + (-sample - threshold) / 5000f)
+        } else {
+            sample
+        }
+    }
+
+    private fun releaseAudioFx() {
+        try {
+            noiseSuppressor?.release()
+            noiseSuppressor = null
+        } catch (_: Exception) {}
+        try {
+            agc?.release()
+            agc = null
+        } catch (_: Exception) {}
+        try {
+            aec?.release()
+            aec = null
+        } catch (_: Exception) {}
+    }
+
     fun stop() {
         if (!isRecording) return
         isRecording = false
 
         timerThread?.interrupt()
+        releaseAudioFx()
 
         try {
             micCaptureThread?.join(500)
